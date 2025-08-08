@@ -40,8 +40,8 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 EXPECTED_BEARER_TOKEN = "612aeb3ebe9d63cfdb21e3f7d679fcebde54f7c1283c92b7937ea72c10c966af"
 PINECONE_INDEX_NAME = "hackrx" 
-# Using smaller model to reduce memory usage
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L12-v2"  # Smaller model
+# Using smallest possible model to reduce memory and load time
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"  # Smallest viable model (~23MB)
 
 if not all([PINECONE_API_KEY, GOOGLE_API_KEY]):
     raise ValueError("API keys for Pinecone and Google are not set in the environment variables.")
@@ -82,8 +82,8 @@ def get_cached_embeddings():
             logging.info("Loading universal embeddings model...")
             _embeddings_cache = HuggingFaceEmbeddings(
                 model_name=EMBEDDING_MODEL_NAME,
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'batch_size': 4}  # Reduced batch size for memory
+                model_kwargs={'device': 'cpu', 'trust_remote_code': True},
+                encode_kwargs={'batch_size': 2, 'show_progress_bar': False}  # Even smaller batch size
             )
             logging.info("✅ Universal embeddings loaded successfully")
             # Force garbage collection after loading
@@ -384,7 +384,27 @@ def load_and_chunk_document_from_url(url: str) -> List[Document]:
     """Universal document loading with adaptive chunking"""
     logging.info(f"Loading document for universal processing: {url}")
     try:
-        response = requests.get(url, timeout=30)
+        # Fix multiple levels of URL encoding for Azure Blob URLs
+        import urllib.parse
+        original_url = url
+        
+        # Keep decoding until no more %25 patterns are found
+        while '%25' in url:
+            decoded_url = urllib.parse.unquote(url)
+            if decoded_url == url:  # No change, break to avoid infinite loop
+                break
+            url = decoded_url
+            logging.info(f"Decoded URL step: {url}")
+        
+        if url != original_url:
+            logging.info(f"Final decoded URL: {url}")
+        
+        # Add headers for Azure Blob Storage compatibility
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(url, timeout=30, headers=headers)
         response.raise_for_status()
         
         temp_file_path = "temp_document.pdf"
