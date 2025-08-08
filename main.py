@@ -79,15 +79,28 @@ def get_cached_embeddings():
     global _embeddings_cache
     if _embeddings_cache is None:
         try:
-            logging.info("Loading universal embeddings model...")
+            logging.info("Loading minimal embeddings model...")
+            
+            # Force garbage collection before loading
+            gc.collect()
+            
             _embeddings_cache = HuggingFaceEmbeddings(
                 model_name=EMBEDDING_MODEL_NAME,
-                model_kwargs={'device': 'cpu', 'trust_remote_code': True},
-                encode_kwargs={'batch_size': 2, 'show_progress_bar': False}  # Even smaller batch size
+                model_kwargs={
+                    'device': 'cpu',
+                    'trust_remote_code': True
+                },
+                encode_kwargs={
+                    'batch_size': 1,  # Minimum batch size
+                    'show_progress_bar': False,
+                    'convert_to_numpy': True
+                }
             )
-            logging.info("✅ Universal embeddings loaded successfully")
-            # Force garbage collection after loading
+            logging.info("✅ Minimal embeddings loaded successfully")
+            
+            # Aggressive cleanup after loading
             gc.collect()
+            
         except Exception as e:
             logging.error(f"Failed to load embeddings: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to load embeddings: {e}")
@@ -211,23 +224,11 @@ class UniversalHybridVectorStore:
         logging.info(f"✅ Universal hybrid store created: {len(documents)} docs, domain: {self.domain}")
     
     def _precompute_embeddings(self):
-        """Precompute embeddings for semantic search"""
+        """Skip embeddings precomputation to save memory"""
         try:
-            texts = [doc.page_content for doc in self.documents]
-            # Process in smaller batches to reduce memory usage
-            batch_size = 10
-            self.document_embeddings = []
-            
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i + batch_size]
-                batch_embeddings = self.embeddings.embed_documents(batch_texts)
-                self.document_embeddings.extend(batch_embeddings)
-                
-                # Force garbage collection after each batch
-                if i % (batch_size * 2) == 0:
-                    gc.collect()
-            
-            logging.info("✅ Document embeddings precomputed")
+            # Skip precomputation for now to save memory and startup time
+            logging.info("⚠️ Skipping embeddings precomputation to save memory")
+            self.document_embeddings = None
         except Exception as e:
             logging.warning(f"Failed to precompute embeddings: {e}")
             self.document_embeddings = None
@@ -404,7 +405,7 @@ def load_and_chunk_document_from_url(url: str) -> List[Document]:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        response = requests.get(url, timeout=30, headers=headers)
+        response = requests.get(url, timeout=60, headers=headers)  # Increased timeout
         response.raise_for_status()
         
         temp_file_path = "temp_document.pdf"
