@@ -8,6 +8,7 @@ import re
 import math
 from collections import Counter
 import hashlib
+from contextlib import asynccontextmanager
 
 import requests
 import uvicorn
@@ -39,16 +40,11 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 EXPECTED_BEARER_TOKEN = "612aeb3ebe9d63cfdb21e3f7d679fcebde54f7c1283c92b7937ea72c10c966af"
 PINECONE_INDEX_NAME = "hackrx" 
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# Using smaller model to reduce memory usage
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L12-v2"  # Smaller model
 
 if not all([PINECONE_API_KEY, GOOGLE_API_KEY]):
     raise ValueError("API keys for Pinecone and Google are not set in the environment variables.")
-
-app = FastAPI(
-    title="Universal Hybrid Search RAG System",
-    description="Domain-agnostic RAG with adaptive hybrid search for any document type",
-    version="3.0.0"
-)
 
 class HackRxRequest(BaseModel):
     documents: str = Field(..., description="URL to the PDF document")
@@ -59,7 +55,7 @@ class HackRxResponse(BaseModel):
 
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
-# Cache for embeddings and LLM
+# Cache for embeddings and LLM - will be loaded lazily
 _embeddings_cache = None
 _llm_cache = None
 
@@ -87,9 +83,11 @@ def get_cached_embeddings():
             _embeddings_cache = HuggingFaceEmbeddings(
                 model_name=EMBEDDING_MODEL_NAME,
                 model_kwargs={'device': 'cpu'},
-                encode_kwargs={'batch_size': 8}
+                encode_kwargs={'batch_size': 4}  # Reduced batch size for memory
             )
             logging.info("✅ Universal embeddings loaded successfully")
+            # Force garbage collection after loading
+            gc.collect()
         except Exception as e:
             logging.error(f"Failed to load embeddings: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to load embeddings: {e}")
@@ -216,7 +214,19 @@ class UniversalHybridVectorStore:
         """Precompute embeddings for semantic search"""
         try:
             texts = [doc.page_content for doc in self.documents]
-            self.document_embeddings = self.embeddings.embed_documents(texts)
+            # Process in smaller batches to reduce memory usage
+            batch_size = 10
+            self.document_embeddings = []
+            
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                batch_embeddings = self.embeddings.embed_documents(batch_texts)
+                self.document_embeddings.extend(batch_embeddings)
+                
+                # Force garbage collection after each batch
+                if i % (batch_size * 2) == 0:
+                    gc.collect()
+            
             logging.info("✅ Document embeddings precomputed")
         except Exception as e:
             logging.warning(f"Failed to precompute embeddings: {e}")
@@ -385,8 +395,8 @@ def load_and_chunk_document_from_url(url: str) -> List[Document]:
         loader = PyPDFLoader(temp_file_path)
         docs = loader.load_and_split(
             text_splitter=RecursiveCharacterTextSplitter(
-                chunk_size=1000,  # Balanced for most document types
-                chunk_overlap=200,  # Sufficient overlap for context
+                chunk_size=800,  # Slightly smaller chunks for memory efficiency
+                chunk_overlap=150,  # Reduced overlap
                 separators=["\n\n", "\n", ". ", ".", " ", ""]
             )
         )
@@ -490,6 +500,35 @@ def format_docs(docs: List[Document]) -> str:
         formatted_sections.append(f"--- Section {i} ---\n{doc.page_content}")
     return "\n\n".join(formatted_sections)
 
+# Lifespan context manager for startup/shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logging.info("🚀 Starting Universal RAG System...")
+    logging.info("⚡ Embeddings will load lazily when first needed")
+    
+    memory_usage = get_memory_usage()
+    logging.info(f"📊 Startup memory: {memory_usage:.1f}MB")
+    logging.info("🌍 Universal system ready for any document domain")
+    
+    yield
+    
+    # Shutdown
+    logging.info("🛑 Shutting down Universal RAG System...")
+    # Clean up resources
+    global _embeddings_cache, _llm_cache
+    _embeddings_cache = None
+    _llm_cache = None
+    gc.collect()
+
+# Create FastAPI app with lifespan
+app = FastAPI(
+    title="Universal Hybrid Search RAG System",
+    description="Domain-agnostic RAG with adaptive hybrid search for any document type",
+    version="3.0.0",
+    lifespan=lifespan
+)
+
 @app.post("/hackrx/run", response_model=HackRxResponse, dependencies=[Depends(verify_token)])
 async def run_submission(request: HackRxRequest):
     logging.info("🚀 Processing with universal hybrid search...")
@@ -510,6 +549,9 @@ async def run_submission(request: HackRxRequest):
                 answer = rag_chain.invoke(question)
                 answers.append(answer.strip())
                 logging.info(f"✅ Question {i} completed")
+                
+                # Clean up memory after each question
+                gc.collect()
                 
             except Exception as e:
                 logging.error(f"Error on question {i}: {e}")
@@ -558,19 +600,6 @@ async def root():
         "docs": "/docs",
         "health": "/health"
     }
-
-@app.on_event("startup")
-async def startup_event():
-    logging.info("🚀 Starting Universal RAG System...")
-    try:
-        get_cached_embeddings()
-        logging.info("✅ Universal embeddings ready")
-    except Exception as e:
-        logging.warning(f"⚠️ Embeddings will load on demand: {e}")
-    
-    memory_usage = get_memory_usage()
-    logging.info(f"📊 Startup memory: {memory_usage:.1f}MB")
-    logging.info("🌍 Universal system ready for any document domain")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
